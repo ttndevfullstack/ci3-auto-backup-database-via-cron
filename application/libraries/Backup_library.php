@@ -11,7 +11,7 @@ class Backup_library
     protected $s3;
 
     protected string $backup_path = '';
-    
+
     protected int $max_local_backups;
 
     protected string $s3_bucket;
@@ -19,8 +19,12 @@ class Backup_library
     public function __construct()
     {
         $this->CI = &get_instance();
+        $this->CI->load->model('backup_model');
+        $this->CI->load->database();
+
         $this->CI->config->load('aws');
         $this->CI->config->load('backup');
+
         $this->backup_path = $this->CI->config->item('backup_path');
         $this->max_local_backups = $this->CI->config->item('max_local_backups');
         $this->s3_bucket = $this->CI->config->item('s3_bucket');
@@ -28,7 +32,7 @@ class Backup_library
         if (! $this->backup_path || ! $this->max_local_backups || ! $this->s3_bucket) {
             throw new Exception('Backup path or max local backups not set in config.');
         }
-        
+
         if (! $this->CI->config->item('aws_access_key') || ! $this->CI->config->item('aws_secret_key')) {
             throw new Exception('AWS credentials not set in config.');
         }
@@ -50,20 +54,31 @@ class Backup_library
         $this->CI->load->dbutil();
         $backup = $this->CI->dbutil->backup();
 
-        $this->create_local_backup($file_name, $backup);
+        $backup_id = $this->CI->backup_model->create_backup_history($file_name, strlen($backup));
 
-        $this->upload_to_s3($file_name, $backup);
+        try {
+            $this->create_local_backup($file_name, $backup);
+            $s3_url = $this->upload_to_s3($file_name);
 
-        $this->cleanup_old_backups();
+            $this->CI->backup_model->update_backup_status($backup_id, 'completed', $s3_url);
+            $this->cleanup_old_backups();
+        } catch (Throwable $e) {
+            $this->CI->backup_model->update_backup_status($backup_id, 'failed');
+            throw $e;
+        }
     }
 
-    public function create_local_backups(string $file_name, $backup): void
+    public function create_local_backup(string $file_name, $backup): void
     {
         try {
             $local_backup_file_path = $this->generate_local_backup_path($file_name);
 
             if (! file_exists($local_backup_file_path)) {
-                mkdir($local_backup_file_path, 0755, true);
+                if (! file_exists($this->backup_path)) {
+                    mkdir($this->backup_path, 0755, true);
+                }
+
+                file_put_contents($local_backup_file_path, '');
             }
 
             file_put_contents($local_backup_file_path, $backup);
@@ -72,17 +87,19 @@ class Backup_library
         }
     }
 
-    public function upload_to_s3(string $file_name): void
+    public function upload_to_s3(string $file_name): string
     {
         try {
-            $this->s3->putObject([
+            $result = $this->s3->putObject([
                 'Bucket' => $this->s3_bucket,
                 'Key' => $file_name,
                 'SourceFile' => $this->generate_local_backup_path($file_name),
                 'ACL' => 'private',
             ]);
+            return $result['ObjectURL'];
         } catch (Throwable $e) {
             log_message('error', 'S3 Upload Error: ' . $e->getMessage());
+            throw $e;
         }
     }
 
@@ -101,6 +118,26 @@ class Backup_library
                 break;
             }
         }
+    }
+
+    public function get_backup_settings()
+    {
+        return $this->CI->backup_model->get_settings();
+    }
+
+    public function update_backup_settings($data)
+    {
+        $this->CI->backup_model->update_settings($data);
+        $this->update_cron_schedule($data['backup_time']);
+    }
+
+    private function update_cron_schedule($time)
+    {
+        // Update system crontab
+        $cron_time = explode(':', $time);
+        $cron_command = "{$cron_time[1]} {$cron_time[0]} * * * php " . FCPATH . "index.php backup execute";
+        exec("(crontab -l | grep -v 'backup execute') | crontab -");
+        exec("(crontab -l; echo \"$cron_command\") | crontab -");
     }
 
     private function generate_local_backup_path(string $file_name): string
